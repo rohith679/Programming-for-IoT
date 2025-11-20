@@ -1,115 +1,116 @@
-/******************************************************
- Smart Thermostat (ESP8266 NodeMCU + Blynk)
- Components: NodeMCU ESP8266, DHT22, Relay
- Features: Temperature/Humidity monitoring, Appliance control, Blynk dashboard sync
-******************************************************/
-
-#define BLYNK_TEMPLATE_ID "TMPL33sBY_43p"
-#define BLYNK_TEMPLATE_NAME "Smart Thermostat"
-#define BLYNK_AUTH_TOKEN "MF08YXuT3DU1XBkL_KLcIjldI5w7vaM1"
-#define BLYNK_PRINT Serial
-
-#include <ESP8266WiFi.h>         // ✅ ESP8266 WiFi library
-#include <BlynkSimpleEsp8266.h>  // ✅ Blynk library for NodeMCU
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
 #include "DHT.h"
 
-// WiFi credentials
-char ssid[] = "Rahul's S24 FE";
-char pass[] = "rahul2005";
-
-// Pin and Sensor setup
 #define DHTPIN D2
 #define DHTTYPE DHT11
-#define RELAY_PIN D4     
+#define RELAY_PIN D4
 
+// ==== Wi-Fi credentials ====
+const char* ssid = "pheonixscar";          // your Wi-Fi name
+const char* password = "Pheonixscar08@";    // your Wi-Fi password
+
+// ==== MQTT Broker (your laptop IP) ====
+const char* mqtt_server = "10.62.15.75"; // <<---- YOUR IPv4 ADDRESS
+
+WiFiClient espClient;
+PubSubClient client(espClient);
 DHT dht(DHTPIN, DHTTYPE);
-BlynkTimer timer;
 
-// Virtual Pin assignments
-#define VPIN_TEMP V0
-#define VPIN_HUMIDITY V1
-#define VPIN_SETPOINT V2
-#define VPIN_APPLIANCE V3
-
-// Global variables
+// ==== Variables ====
 float temp_c = 0.0;
 float humidity = 0.0;
-float setpoint_temp = 25.0; // Default setpoint (°C)
-int relay_state = HIGH;     // Relay OFF initially (active-LOW)
+float setpoint_temp = 25.0;
+bool relayState = false;
+float hysteresis = 2.0;
 
-// Relay control helper
-void setRelay(int state) {
-  digitalWrite(RELAY_PIN, state);
-  relay_state = state;
-  Blynk.virtualWrite(VPIN_APPLIANCE, relay_state == LOW ? 1 : 0);
-}
-
-// ---- Blynk Interaction ----
-
-// Setpoint from app (slider/numeric on V2)
-BLYNK_WRITE(VPIN_SETPOINT) {
-  setpoint_temp = param.asFloat();
-  Serial.print("New setpoint received: ");
-  Serial.println(setpoint_temp);
-  // Echo back to Blynk app
-  Blynk.virtualWrite(VPIN_SETPOINT, setpoint_temp);
-}
-
-// Manual ON/OFF from app (button on V3)
-BLYNK_WRITE(VPIN_APPLIANCE) {
-  int new_state = param.asInt();
-  Serial.print("Manual appliance state: ");
-  Serial.println(new_state);
-  setRelay(new_state == 1 ? LOW : HIGH);
-}
-
-// ---- Periodic Sensor/Control Task ----
-void readAndSendSensorData() {
-  humidity = dht.readHumidity();
-  temp_c = dht.readTemperature();
-
-  if (isnan(humidity) || isnan(temp_c)) {
-    Serial.println("Failed to read DHT11!");
-    return;
+// ==== Wi-Fi connection ====
+void setup_wifi() {
+  delay(10);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
+  Serial.println("\n✅ Wi-Fi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
 
-  Blynk.virtualWrite(VPIN_TEMP, temp_c);
-  Blynk.virtualWrite(VPIN_HUMIDITY, humidity);
-  Serial.printf("Temperature: %.2f°C, Humidity: %.2f%%\n", temp_c, humidity);
-  Serial.println("Data sent to Blynk.");
+// ==== MQTT callback ====
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
+  Serial.printf("Message arrived [%s]: %s\n", topic, message.c_str());
 
-  // Hysteresis control: avoid rapid toggling near setpoint
-  if (temp_c > setpoint_temp && relay_state == HIGH) {
-    setRelay(LOW); // ON
-    Serial.println("Temperature above setpoint → Turning ON appliance.");
-  } else if (temp_c < setpoint_temp - 2.0 && relay_state == LOW) {
-    setRelay(HIGH); // OFF
-    Serial.println("Temperature below setpoint → Turning OFF appliance.");
+  if (String(topic) == "home/thermostat/setpoint") {
+    setpoint_temp = message.toFloat();
+    Serial.printf("Setpoint updated: %.2f°C\n", setpoint_temp);
+  }
+  else if (String(topic) == "home/thermostat/control") {
+    if (message == "ON")  relayState = true;
+    else if (message == "OFF") relayState = false;
+    digitalWrite(RELAY_PIN, relayState);
+    Serial.printf("Manual control → Relay: %s\n", relayState ? "ON" : "OFF");
   }
 }
 
-// ---- Setup ----
+// ==== MQTT reconnect ====
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("NodeMCU_Client")) {
+      Serial.println("connected");
+      client.subscribe("home/thermostat/control");
+      client.subscribe("home/thermostat/setpoint");
+    } else {
+      Serial.printf("failed, rc=%d  retry in 5 s\n", client.state());
+      delay(5000);
+    }
+  }
+}
+
+// ==== Setup ====
 void setup() {
   Serial.begin(115200);
   pinMode(RELAY_PIN, OUTPUT);
-  setRelay(HIGH); // Relay OFF at startup
+  digitalWrite(RELAY_PIN, LOW);
   dht.begin();
-
-  // Connect to WiFi & Blynk
-  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
-
-  // Confirmation message
-  Serial.println("✅ Connected to WiFi and Blynk (Internet available)");
-
-  // Sync setpoint from app on startup
-  Blynk.syncVirtual(VPIN_SETPOINT);
-
-  // Read sensor every 2 seconds
-  timer.setInterval(2000L, readAndSendSensorData);
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
 }
 
-// ---- Main Loop ----
+// ==== Main Loop ====
 void loop() {
-  Blynk.run();
-  timer.run();
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  static unsigned long lastMsg = 0;
+  if (millis() - lastMsg > 2000) {             // every 2 s
+    lastMsg = millis();
+    humidity = dht.readHumidity();
+    temp_c = dht.readTemperature();
+
+    if (isnan(temp_c) || isnan(humidity)) return;
+
+    // Publish sensor data
+    client.publish("home/thermostat/temperature", String(temp_c).c_str());
+    client.publish("home/thermostat/humidity", String(humidity).c_str());
+
+    // Automatic control
+    if (temp_c > setpoint_temp && !relayState) {
+      relayState = true;
+      digitalWrite(RELAY_PIN, HIGH);
+      client.publish("home/thermostat/relay", "ON");
+    } else if (temp_c < setpoint_temp - hysteresis && relayState) {
+      relayState = false;
+      digitalWrite(RELAY_PIN, LOW);
+      client.publish("home/thermostat/relay", "OFF");
+    }
+
+    Serial.printf("Temp: %.1f°C | Hum: %.1f%% | Relay: %s\n",
+                  temp_c, humidity, relayState ? "ON" : "OFF");
+  }
 }
